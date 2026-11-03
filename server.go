@@ -120,6 +120,7 @@ func (s *Server) serve() error {
 	}
 
 	i := 0
+	var delay time.Duration
 
 	for {
 		rw, err := s.Listener.Accept()
@@ -132,9 +133,26 @@ func (s *Server) serve() error {
 			if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
 				continue
 			}
-			log(s.Listener.Addr().String(), "accept: %s", err)
-			return err
+			if errors.Is(err, net.ErrClosed) {
+				log(s.Listener.Addr().String(), "accept: %s", err)
+				return err
+			}
+			// Other errors, such as running out of file descriptors, are
+			// usually transient: back off and keep serving, like net/http.
+			if delay == 0 {
+				delay = 5 * time.Millisecond
+			} else if delay *= 2; delay > time.Second {
+				delay = time.Second
+			}
+			log(s.Listener.Addr().String(), "accept: %s; retrying in %v", err, delay)
+			select {
+			case <-s.chDone:
+				return nil
+			case <-time.After(delay):
+			}
+			continue
 		}
+		delay = 0
 
 		if s.ReadTimeout != 0 {
 			rw.SetReadDeadline(time.Now().Add(s.ReadTimeout))
