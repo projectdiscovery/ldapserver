@@ -6,22 +6,26 @@ import (
 	"sync"
 	"time"
 
-	ldap "github.com/lor00x/goldap/message"
+	ldap "github.com/vjeantet/goldap/message"
 )
 
 type client struct {
-	Numero      int
-	srv         *Server
-	rwc         net.Conn
-	br          *bufio.Reader
-	bw          *bufio.Writer
-	chanOut     chan *ldap.LDAPMessage
-	wg          sync.WaitGroup
-	closing     chan bool
-	requestList map[int]*Message
-	mutex       sync.Mutex
-	writeDone   chan bool
-	rawData     []byte
+	Numero        int
+	srv           *Server
+	rwc           net.Conn
+	br            *bufio.Reader
+	bw            *bufio.Writer
+	chanOut       chan *ldap.LDAPMessage
+	wg            sync.WaitGroup
+	closing       chan bool
+	shutdownDone  chan struct{}
+	requestList   map[int]*Message
+	mutex         sync.Mutex
+	writeDone     chan bool
+	rawData       []byte
+	data          any
+	handler       Handler
+	hasOwnHandler bool
 }
 
 func (c *client) GetConn() net.Conn {
@@ -32,6 +36,18 @@ func (c *client) GetRaw() []byte {
 	return c.rawData
 }
 
+// GetData returns the custom data associated with this client connection.
+func (c *client) GetData() any {
+	return c.data
+}
+
+// SetData associates arbitrary custom data with this client connection.
+// This can be used by handlers to store per-connection state such as
+// authentication results or session information.
+func (c *client) SetData(data any) {
+	c.data = data
+}
+
 func (c *client) SetConn(conn net.Conn) {
 	c.rwc = conn
 	c.br = bufio.NewReader(c.rwc)
@@ -39,7 +55,10 @@ func (c *client) SetConn(conn net.Conn) {
 }
 
 func (c *client) GetMessageByID(messageID int) (*Message, bool) {
-	if requestToAbandon, ok := c.requestList[messageID]; ok {
+	c.mutex.Lock()
+	requestToAbandon, ok := c.requestList[messageID]
+	c.mutex.Unlock()
+	if ok {
 		return requestToAbandon, true
 	}
 	return nil, false
@@ -56,16 +75,25 @@ func (c *client) ReadPacket() (*messagePacket, error) {
 	return mP, err
 }
 
+func (c *client) callOnClose() {
+	if c == nil || c.srv == nil || c.srv.OnClientClose == nil {
+		return
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			log(c.Addr().String(), "panic in OnClientClose for client [%d]: %v", c.Numero, r)
+		}
+	}()
+
+	c.srv.OnClientClose(c.rwc, c.data)
+}
+
 func (c *client) serve() {
 	defer c.close()
 
 	c.closing = make(chan bool)
-	if onc := c.srv.OnNewConnection; onc != nil {
-		if err := onc(c.rwc); err != nil {
-			log(c.Addr().String(), "Error OnNewConnection: %s", err)
-			return
-		}
-	}
+	c.shutdownDone = make(chan struct{})
 
 	// Create the ldap response queue to be writted to client (buffered to 20)
 	// buffered to 20 means that If client is slow to handler responses, Server
@@ -82,10 +110,10 @@ func (c *client) serve() {
 
 	// Listen for server signal to shutdown
 	go func() {
+		defer close(c.shutdownDone)
 		for {
 			select {
 			case <-c.srv.chDone: // server signals shutdown process
-				c.wg.Add(1)
 				r := NewExtendedResponse(LDAPResultUnwillingToPerform)
 				r.SetDiagnosticMessage("server is about to stop")
 				r.SetResponseName(NoticeOfDisconnection)
@@ -93,7 +121,6 @@ func (c *client) serve() {
 				m := ldap.NewLDAPMessageWithProtocolOp(r)
 
 				c.chanOut <- m
-				c.wg.Done()
 				c.rwc.SetReadDeadline(time.Now().Add(time.Millisecond))
 				return
 			case <-c.closing:
@@ -101,6 +128,13 @@ func (c *client) serve() {
 			}
 		}
 	}()
+
+	if onc := c.srv.OnNewConnection; onc != nil {
+		if err := onc(c.rwc); err != nil {
+			log(c.Addr().String(), "Error OnNewConnection: %s", err)
+			return
+		}
+	}
 
 	c.requestList = make(map[int]*Message)
 
@@ -170,7 +204,10 @@ func (c *client) serve() {
 // * signal to server that client shutdown is ok
 func (c *client) close() {
 	log(c.Addr().String(), "client %d close()", c.Numero)
+	defer c.srv.wg.Done()
+
 	close(c.closing)
+	<-c.shutdownDone // wait for shutdown-listener goroutine to finish
 
 	// stop reading from client
 	c.rwc.SetReadDeadline(time.Now().Add(time.Millisecond))
@@ -190,10 +227,9 @@ func (c *client) close() {
 	log(c.Addr().String(), "client [%d] request processors ended", c.Numero)
 
 	<-c.writeDone // Wait for the last message sent to be written
+	c.callOnClose()
 	c.rwc.Close() // close client connection
 	log(c.Addr().String(), "client [%d] connection closed", c.Numero)
-
-	c.srv.wg.Done() // signal to server that client shutdown is ok
 }
 
 func (c *client) writeMessage(m *ldap.LDAPMessage) {
@@ -221,6 +257,30 @@ func (w responseWriterImpl) Write(po ldap.ProtocolOp) {
 	w.chanOut <- m
 }
 
+func (w responseWriterImpl) writeWithControls(po ldap.ProtocolOp, controls ldap.Controls) {
+	m := ldap.NewLDAPMessageWithProtocolOp(po)
+	m.SetMessageID(w.messageID)
+	m.SetControls(controls.Pointer())
+	w.chanOut <- m
+}
+
+// controlsWriter is an optional interface for ResponseWriter implementations
+// that support attaching controls to an LDAP response message.
+type controlsWriter interface {
+	writeWithControls(po ldap.ProtocolOp, controls ldap.Controls)
+}
+
+// WriteWithControls writes an LDAP response with the given controls attached
+// to the LDAPMessage envelope. If the ResponseWriter does not support controls,
+// it falls back to w.Write(po).
+func WriteWithControls(w ResponseWriter, po ldap.ProtocolOp, controls ...ldap.Control) {
+	if cw, ok := w.(controlsWriter); ok {
+		cw.writeWithControls(po, ldap.Controls(controls))
+		return
+	}
+	w.Write(po)
+}
+
 func (c *client) ProcessRequestMessage(message *ldap.LDAPMessage) {
 	defer c.wg.Done()
 
@@ -237,7 +297,11 @@ func (c *client) ProcessRequestMessage(message *ldap.LDAPMessage) {
 	w.chanOut = c.chanOut
 	w.messageID = m.MessageID().Int()
 
-	c.srv.Handler.ServeLDAP(w, &m)
+	if c.handler != nil {
+		c.handler.ServeLDAP(w, &m)
+	} else {
+		c.srv.Handler.ServeLDAP(w, &m)
+	}
 }
 
 func (c *client) registerRequest(m *Message) {
