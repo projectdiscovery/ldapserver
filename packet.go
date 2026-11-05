@@ -3,6 +3,7 @@ package ldapserver
 import (
 	"bufio"
 	"fmt"
+	"io"
 
 	ldap "github.com/vjeantet/goldap/message"
 )
@@ -54,7 +55,7 @@ func readLdapMessageBytes(br *bufio.Reader) (ret *[]byte, err error) {
 	if err != nil {
 		return
 	}
-	readBytes(br, &bytes, tagAndLength.Length)
+	_, err = readBytes(br, &bytes, tagAndLength.Length)
 	return &bytes, err
 }
 
@@ -136,7 +137,7 @@ func readTagAndLength(conn *bufio.Reader, bytes *[]byte) (ret ldap.TagAndLength,
 // Return the last read byte
 func readBytes(conn *bufio.Reader, bytes *[]byte, length int) (b byte, err error) {
 	newbytes := make([]byte, length)
-	n, err := conn.Read(newbytes)
+	n, err := io.ReadFull(conn, newbytes)
 	if n != length {
 		err = fmt.Errorf("%d bytes read instead of %d", n, length)
 		return
