@@ -1,6 +1,6 @@
 package ldapserver
 
-import ldap "github.com/lor00x/goldap/message"
+import ldap "github.com/vjeantet/goldap/message"
 
 // LDAP Application Codes
 const (
@@ -68,6 +68,11 @@ const (
 	LDAPResultAffectsMultipleDSAs          = 71
 	LDAPResultOther                        = 80
 
+	LDAPResultCanceled        = 118
+	LDAPResultNoSuchOperation = 119
+	LDAPResultTooLate         = 120
+	LDAPResultCannotCancel    = 121
+
 	ErrorNetwork         = 200
 	ErrorFilterCompile   = 201
 	ErrorFilterDecompile = 202
@@ -83,6 +88,10 @@ const (
 
 const SearchRequestScopeBaseObject = 0
 const SearchRequestSingleLevel = 1
+const SearchRequestWholeSubtree = 2
+
+// misspelling of "WholeSubtree", preserved
+// for compatibility, at least for now ...
 const SearchRequestHomeSubtree = 2
 
 // Extended operation responseName and requestName

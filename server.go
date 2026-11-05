@@ -2,11 +2,18 @@ package ldapserver
 
 import (
 	"bufio"
+	"crypto/tls"
 	"errors"
 	"net"
 	"sync"
 	"time"
 )
+
+type HandlerSource interface {
+	GetHandler() Handler
+}
+
+type ClientCloseHandler func(conn net.Conn, data any)
 
 // Server is an LDAP server.
 type Server struct {
@@ -16,13 +23,26 @@ type Server struct {
 	wg           sync.WaitGroup // group of goroutines (1 by client)
 	chDone       chan bool      // Channel Done, value => shutdown
 
+	// TLSConfig optionally provides a TLS configuration for use by ServeTLS.
+	TLSConfig *tls.Config
+
 	// OnNewConnection, if non-nil, is called on new connections.
 	// If it returns non-nil, the connection is closed.
 	OnNewConnection func(c net.Conn) error
 
+	// OnClientClose, if non-nil, is called once when a client session ends.
+	// It runs after request processing has stopped and before the connection is
+	// closed. The hook must not block because it runs on the shutdown path and
+	// a blocking hook prevents Stop from completing. Data may be nil because
+	// the hook runs for every closed connection, including connections rejected
+	// by OnNewConnection or closed before SetData is called.
+	OnClientClose ClientCloseHandler
+
 	// Handler handles ldap message received from client
 	// it SHOULD "implement" RequestHandler interface
-	Handler Handler
+	Handler          Handler
+	useHandlerSource bool
+	handlerSource    HandlerSource
 }
 
 // NewServer return a LDAP Server
@@ -32,9 +52,25 @@ func NewServer() *Server {
 	}
 }
 
+// NewServer returns an LDAP Server, with a dedicated handler for each connection
+// different to the "Handler", this allows one struct (object) for each connection.
+// this is intented to pass information from one handle function to another, for
+// example, if Bind() fails, a flag may be set in the source to decline subsequent searches
+// (or limit them in scope).
+func NewServerWithHandlerSource(hs HandlerSource) *Server {
+	return &Server{
+		handlerSource:    hs,
+		useHandlerSource: true,
+		chDone:           make(chan bool),
+	}
+}
+
 // Handle registers the handler for the server.
 // If a handler already exists for pattern, Handle panics
 func (s *Server) Handle(h Handler) error {
+	if s.useHandlerSource {
+		return errors.New("LDAP: attempt to register handler and a handlersource")
+	}
 	if s.Handler != nil {
 		return errors.New("LDAP: multiple Handler registrations")
 	}
@@ -42,11 +78,24 @@ func (s *Server) Handle(h Handler) error {
 	return nil
 }
 
+// Serve accepts incoming LDAP connections on the given listener.
+// The Server takes ownership of the listener and will close it when Stop is called.
+func (s *Server) Serve(listener net.Listener) error {
+	s.Listener = listener
+	return s.serve()
+}
+
+// ServeTLS wraps the given listener with TLS using s.TLSConfig
+// and accepts incoming LDAP connections.
+func (s *Server) ServeTLS(listener net.Listener) error {
+	s.Listener = tls.NewListener(listener, s.TLSConfig)
+	return s.serve()
+}
+
 // ListenAndServe listens on the TCP network address s.Addr and then
 // calls Serve to handle requests on incoming connections.  If
 // s.Addr is blank, ":389" is used.
 func (s *Server) ListenAndServe(addr string, options ...func(*Server)) error {
-
 	if addr == "" {
 		addr = ":389"
 	}
@@ -66,23 +115,44 @@ func (s *Server) ListenAndServe(addr string, options ...func(*Server)) error {
 
 // Handle requests messages on the ln listener
 func (s *Server) serve() error {
-	defer s.Listener.Close()
-
-	if s.Handler == nil {
+	if s.Handler == nil && !s.useHandlerSource {
 		panic("No LDAP Request Handler defined")
 	}
 
 	i := 0
+	var delay time.Duration
 
 	for {
-		select {
-		case <-s.chDone:
-			s.Listener.Close()
-			return nil
-		default:
-		}
-
 		rw, err := s.Listener.Accept()
+		if err != nil {
+			select {
+			case <-s.chDone:
+				return nil
+			default:
+			}
+			if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
+				continue
+			}
+			if errors.Is(err, net.ErrClosed) {
+				log(s.Listener.Addr().String(), "accept: %s", err)
+				return err
+			}
+			// Other errors, such as running out of file descriptors, are
+			// usually transient: back off and keep serving, like net/http.
+			if delay == 0 {
+				delay = 5 * time.Millisecond
+			} else if delay *= 2; delay > time.Second {
+				delay = time.Second
+			}
+			log(s.Listener.Addr().String(), "accept: %s; retrying in %v", err, delay)
+			select {
+			case <-s.chDone:
+				return nil
+			case <-time.After(delay):
+			}
+			continue
+		}
+		delay = 0
 
 		if s.ReadTimeout != 0 {
 			rw.SetReadDeadline(time.Now().Add(s.ReadTimeout))
@@ -90,15 +160,8 @@ func (s *Server) serve() error {
 		if s.WriteTimeout != 0 {
 			rw.SetWriteDeadline(time.Now().Add(s.WriteTimeout))
 		}
-		if nil != err {
-			if opErr, ok := err.(*net.OpError); ok || opErr.Timeout() {
-				continue
-			}
-			log(rw.RemoteAddr().String(), err.Error())
-		}
 
 		cli, err := s.newClient(rw)
-
 		if err != nil {
 			continue
 		}
@@ -120,6 +183,9 @@ func (s *Server) newClient(rwc net.Conn) (c *client, err error) {
 		br:  bufio.NewReader(rwc),
 		bw:  bufio.NewWriter(rwc),
 	}
+	if s.useHandlerSource {
+		c.handler = s.handlerSource.GetHandler()
+	}
 	return c, nil
 }
 
@@ -135,5 +201,6 @@ func (s *Server) newClient(rwc net.Conn) (c *client, err error) {
 // In either case, when the LDAP session is terminated.
 func (s *Server) Stop() {
 	close(s.chDone)
+	s.Listener.Close()
 	s.wg.Wait()
 }

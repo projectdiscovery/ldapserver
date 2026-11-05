@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"fmt"
 
-	ldap "github.com/lor00x/goldap/message"
+	ldap "github.com/vjeantet/goldap/message"
 )
 
 type messagePacket struct {
@@ -139,6 +139,7 @@ func readBytes(conn *bufio.Reader, bytes *[]byte, length int) (b byte, err error
 	n, err := conn.Read(newbytes)
 	if n != length {
 		err = fmt.Errorf("%d bytes read instead of %d", n, length)
+		return
 	} else if err != nil {
 		return
 	}
