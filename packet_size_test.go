@@ -38,3 +38,21 @@ func TestReadMessagePacketAcceptsLimit(t *testing.T) {
 		t.Fatal("message over the limit was accepted")
 	}
 }
+
+func TestReadMessagePacketAllocatesOnlyReceivedBytes(t *testing.T) {
+	// A header that announces MaxMessageSize body bytes and then ends.
+	header := []byte{0x30, 0x84, byte(MaxMessageSize >> 24), byte(MaxMessageSize >> 16), byte(MaxMessageSize >> 8), byte(MaxMessageSize)}
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, err := readMessagePacket(bufio.NewReader(bytes.NewReader(header)))
+	runtime.ReadMemStats(&after)
+
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 256<<10 {
+		t.Errorf("a header with no body allocated %d bytes", allocated)
+	}
+	if err == nil {
+		t.Error("expected an error for a message with a missing body")
+	}
+}

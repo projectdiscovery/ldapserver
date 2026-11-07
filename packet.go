@@ -3,11 +3,12 @@ package ldapserver
 import (
 	"bufio"
 	"fmt"
+	"io"
 
 	ldap "github.com/vjeantet/goldap/message"
 )
 
-// MaxMessageSize is the largest LDAP message, in bytes, that the server reads.
+// MaxMessageSize is the largest LDAP message body length, in bytes, that the server reads.
 var MaxMessageSize = 1 << 20
 
 type messagePacket struct {
@@ -57,7 +58,7 @@ func readLdapMessageBytes(br *bufio.Reader) (ret *[]byte, err error) {
 	if err != nil {
 		return
 	}
-	readBytes(br, &bytes, tagAndLength.Length)
+	err = readBody(br, &bytes, tagAndLength.Length)
 	return &bytes, err
 }
 
@@ -138,6 +139,23 @@ func readTagAndLength(conn *bufio.Reader, bytes *[]byte) (ret ldap.TagAndLength,
 	}
 
 	return
+}
+
+// readBody reads length bytes from the connection in chunks, so the buffer
+// grows with the data that arrives and not with the length the client announces.
+func readBody(conn *bufio.Reader, bytes *[]byte, length int) error {
+	const chunk = 32 << 10
+	for length > 0 {
+		n := min(length, chunk)
+		start := len(*bytes)
+		*bytes = append(*bytes, make([]byte, n)...)
+		if _, err := io.ReadFull(conn, (*bytes)[start:]); err != nil {
+			*bytes = (*bytes)[:start]
+			return err
+		}
+		length -= n
+	}
+	return nil
 }
 
 // Read "length" bytes from the connection
