@@ -7,6 +7,9 @@ import (
 	ldap "github.com/vjeantet/goldap/message"
 )
 
+// MaxMessageSize is the largest LDAP message, in bytes, that the server reads.
+var MaxMessageSize = 1 << 20
+
 type messagePacket struct {
 	bytes []byte
 }
@@ -126,6 +129,12 @@ func readTagAndLength(conn *bufio.Reader, bytes *[]byte) (ret ldap.TagAndLength,
 			// 	return
 			// }
 		}
+	}
+	// The buffer for the message body is allocated from this length before any
+	// of the body arrives, so a client must not be able to pick it freely.
+	if ret.Length > MaxMessageSize {
+		err = ldap.StructuralError{Msg: fmt.Sprintf("message length %d exceeds the %d byte limit", ret.Length, MaxMessageSize)}
+		return
 	}
 
 	return
